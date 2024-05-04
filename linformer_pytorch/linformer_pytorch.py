@@ -1,17 +1,30 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import tensorflow as tf
+from tensorflow.keras import layers, models, initializers, regularizers
+
 
 from torch.utils.checkpoint import checkpoint
 
 def identity(x, *args, **kwargs):
     return x
 
+def gelu(x):
+    return tf.keras.activations.gelu(x)
+
+# def get_act(activation):
+#     if activation == "gelu":
+#         return F.gelu
+#     if activation == "relu":
+#         return F.relu
+#     return None
+
 def get_act(activation):
     if activation == "gelu":
-        return F.gelu
-    if activation == "relu":
-        return F.relu
+        return gelu
+    elif activation == "relu":
+        return tf.nn.relu
     return None
 
 def gen_causal_mask(input_size, dim_k, full_attention=False):
@@ -62,22 +75,39 @@ class Residual(nn.Module):
         tensor = self.norm(tensor)
         return tensor
 
-class PositionalEmbedding(nn.Module):
-    """
-    Standard positional embedding.
-    From the paper "Attention is all you need".
-    Changed the constant from 10k to 100k, since this may be better for longer sequence lengths.
-    """
+# class PositionalEmbedding(nn.Module):
+#     """
+#     Standard positional embedding.
+#     From the paper "Attention is all you need".
+#     Changed the constant from 10k to 100k, since this may be better for longer sequence lengths.
+#     """
+#     def __init__(self, channels):
+#         super(PositionalEmbedding, self).__init__()
+#         inv_freq = 1. / (100000 ** (torch.arange(0, channels, 2).float() / channels))
+#         self.register_buffer('inv_freq', inv_freq)
+
+#     def forward(self, tensor):
+#         pos = torch.arange(tensor.shape[1], device=tensor.device).type(self.inv_freq.type())
+#         sin_inp = torch.einsum("i,j->ij", pos, self.inv_freq)
+#         emb = torch.cat((sin_inp.sin(), sin_inp.cos()), dim=-1)
+#         return emb[None,:,:]
+    
+class PositionalEmbedding(layers.Layer):
     def __init__(self, channels):
         super(PositionalEmbedding, self).__init__()
-        inv_freq = 1. / (100000 ** (torch.arange(0, channels, 2).float() / channels))
-        self.register_buffer('inv_freq', inv_freq)
+        self.channels = channels
 
-    def forward(self, tensor):
-        pos = torch.arange(tensor.shape[1], device=tensor.device).type(self.inv_freq.type())
-        sin_inp = torch.einsum("i,j->ij", pos, self.inv_freq)
-        emb = torch.cat((sin_inp.sin(), sin_inp.cos()), dim=-1)
-        return emb[None,:,:]
+    def build(self, input_shape):
+        pos = tf.range(input_shape[1])
+        i = tf.range(self.channels // 2)
+        denom = tf.exp(tf.cast(i, tf.float32) * -(tf.math.log(100000.0) / (self.channels // 2)))
+        self.pos_embedding = tf.stack([tf.sin(pos[:, None] * denom[None, :]),
+                                       tf.cos(pos[:, None] * denom[None, :])], axis=2)
+        self.pos_embedding = tf.reshape(self.pos_embedding, [-1, input_shape[1], self.channels])
+
+    def call(self, inputs):
+        return inputs + self.pos_embedding
+
 
 class ProjectInOut(nn.Module):
     """
@@ -99,22 +129,23 @@ class FeedForward(nn.Module):
     """
     Standard Feed Forward Layer
     """
-    def __init__(self, input_channels, output_channels, ff_dim, dropout, activation="gelu"):
+    def __init__(self, input_channels, output_channels, ff_dim, dropout_rate, activation="gelu"):
         super(FeedForward, self).__init__()
-        self.w_1 = nn.Linear(input_channels, ff_dim)
-        self.w_2 = nn.Linear(ff_dim, output_channels)
-        self.activation = get_act(activation)
-        self.dropout = nn.Dropout(dropout)
-        self.dropout2 = nn.Dropout(dropout)
+        self.w_1 = layers.Dense(ff_dim, activation=get_act(activation))
+        self.w_2 = layers.Dense(input_channels)
+        # self.activation = get_act(activation)
+        self.dropout = layers.Dropout(dropout_rate)
+        self.dropout2 = layers.Dropout(dropout_rate)
 
     def forward(self, tensor, **kwargs):
         tensor = self.w_1(tensor)
-        if self.activation is not None:
-            tensor = self.activation(tensor)
+        # if self.activation is not None:
+        #     tensor = self.activation(tensor)
         tensor = self.dropout(tensor)
         tensor = self.w_2(tensor)
         tensor = self.dropout2(tensor)
         return tensor
+
 
 class LinearAttentionHead(nn.Module):
     """
